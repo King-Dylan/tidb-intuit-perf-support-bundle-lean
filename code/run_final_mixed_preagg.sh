@@ -12,6 +12,8 @@ READ_MAX_EXECUTION_TIME_MS="${READ_MAX_EXECUTION_TIME_MS:-0}"
 PREAGG_MODE="${PREAGG_MODE:-hybrid}"
 PREAGG_LAYOUT="${PREAGG_LAYOUT:-prod180}"
 REUSE_EVENTS_JSON="${REUSE_EVENTS_JSON:-}"
+TIFLASH_MPP_BUNDLE_IDS="${TIFLASH_MPP_BUNDLE_IDS:-}"
+TIFLASH_MPP_ALL_EVENTS="${TIFLASH_MPP_ALL_EVENTS:-0}"
 NORMAL_EVENTS="${NORMAL_EVENTS:-900}"
 HOT_EVENTS_PER_FIELD="${HOT_EVENTS_PER_FIELD:-10}"
 POOL_SIZE="${POOL_SIZE:-300}"
@@ -91,6 +93,17 @@ if [[ "$PREAGG_MODE" == "hybrid" ]]; then
   done
 fi
 
+if [[ -n "$TIFLASH_MPP_BUNDLE_IDS" ]]; then
+  read -r -a TIFLASH_MPP_BUNDLES <<< "$TIFLASH_MPP_BUNDLE_IDS"
+  for bundle in "${TIFLASH_MPP_BUNDLES[@]}"; do
+    ARGS+=(--tiflash-mpp-bundle "$bundle")
+  done
+fi
+
+if [[ "$TIFLASH_MPP_ALL_EVENTS" == "1" ]]; then
+  ARGS+=(--tiflash-mpp-all-events)
+fi
+
 echo "Starting mixed traffic benchmark"
 echo "label=$LABEL duration=$DURATION read_rate=$READ_RATE hot_event_pct=$HOT_EVENT_PCT preagg_mode=$PREAGG_MODE preagg_layout=$PREAGG_LAYOUT read_max_execution_time_ms=$READ_MAX_EXECUTION_TIME_MS log=$LOG"
 python3 - "$READ_RATE" <<'PY'
@@ -100,6 +113,7 @@ print(f"fanout_target={read_rate:.1f} events/sec * 65 bundles/event = {read_rate
 PY
 echo "normal_events=$NORMAL_EVENTS hot_events_per_field=$HOT_EVENTS_PER_FIELD pool_size=$POOL_SIZE write_pool_size=$WRITE_POOL_SIZE event_workers=$EVENT_WORKERS bundle_workers=$BUNDLE_WORKERS max_pending_events=$MAX_PENDING_EVENTS unique_events_required=$UNIQUE_EVENTS_REQUIRED summary_only=$SUMMARY_ONLY no_writes=$NO_WRITES"
 echo "session: tidb_isolation_read_engines=$TIDB_ISOLATION_READ_ENGINES tidb_opt_force_inline_cte=$INTUIT_FORCE_INLINE_CTE"
+echo "tiflash_mpp_bundles=$TIFLASH_MPP_BUNDLE_IDS tiflash_mpp_all_events=$TIFLASH_MPP_ALL_EVENTS"
 
 python3 -u mixed_traffic_test.py "${ARGS[@]}" 2>&1 | tee "$LOG"
 

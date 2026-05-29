@@ -20,6 +20,7 @@ import json
 import math
 import os
 import random
+import re
 import statistics
 import sys
 import threading
@@ -46,6 +47,8 @@ from sustained_test import writer_thread
 
 
 ROOT = Path(__file__).resolve().parent
+TIFLASH_MPP_HINT = "SET_VAR(tidb_isolation_read_engines='tiflash,tidb') SET_VAR(tidb_enforce_mpp=1)"
+TIFLASH_FILTER_FIELD_RE = re.compile(r"\b[pd]\.([a-z0-9_]+)\s*=\s*%s\b", re.I)
 
 FILTER_FIELDS = [
     ("payment", "p", "merchant_account_number", "merchant_account_number"),
@@ -492,15 +495,36 @@ def render_bundle_sql(
     hinted_a: set[str],
     preagg_bundles: set[str],
     preagg_layout: str,
+    tiflash_mpp_bundles: set[str] | None = None,
 ) -> str:
+    tiflash_mpp_bundles = tiflash_mpp_bundles or set()
     if bundle.bundle_id in preagg_bundles:
         if preagg_layout == "prod180":
             return render_prod180_runtime_query(group, bundle, reference_time)
         return render_runtime_query(group, bundle, reference_time)
     if group == "A":
         base_bundle_id = bundle.bundle_id.split("_split", 1)[0]
-        return bundle.render_sql(reference_time, hinted=(base_bundle_id in hinted_a))
-    return bundle.render_sql(reference_time)
+        sql = bundle.render_sql(reference_time, hinted=(base_bundle_id in hinted_a))
+    else:
+        sql = bundle.render_sql(reference_time)
+    if bundle.bundle_id in tiflash_mpp_bundles:
+        return sql.replace("SELECT\n", f"SELECT /*+ {TIFLASH_MPP_HINT} */\n", 1)
+    return sql
+
+
+def bundle_filter_fields(bundle) -> set[str]:
+    return {match.lower() for match in TIFLASH_FILTER_FIELD_RE.findall(getattr(bundle, "base_filter", ""))}
+
+
+def should_apply_tiflash_mpp(bundle, event: dict[str, Any], tiflash_mpp_bundles: set[str], all_events: bool = False) -> bool:
+    if bundle.bundle_id not in tiflash_mpp_bundles:
+        return False
+    if all_events:
+        return True
+    hot_field = event.get("hot_field")
+    if not hot_field:
+        return False
+    return str(hot_field).lower() in bundle_filter_fields(bundle)
 
 
 def bundle_params(
@@ -567,6 +591,8 @@ def run_one_event_detailed(
     hinted_a: set[str],
     preagg_bundles: set[str],
     preagg_layout: str,
+    tiflash_mpp_bundles: set[str],
+    tiflash_mpp_all_events: bool,
     event: dict[str, Any],
     bundle_executor: ThreadPoolExecutor | None = None,
     store_bundle_results: bool = True,
@@ -581,7 +607,16 @@ def run_one_event_detailed(
     def run_bundle(bundle, group: str, queued_at: float | None = None) -> dict[str, Any]:
         worker_started = time.perf_counter()
         task_queue_ms = ((worker_started - queued_at) * 1000.0) if queued_at is not None else 0.0
-        sql = render_bundle_sql(bundle, group, reference_time, hinted_a, preagg_bundles, preagg_layout)
+        active_tiflash_mpp = should_apply_tiflash_mpp(bundle, event, tiflash_mpp_bundles, all_events=tiflash_mpp_all_events)
+        sql = render_bundle_sql(
+            bundle,
+            group,
+            reference_time,
+            hinted_a,
+            preagg_bundles,
+            preagg_layout,
+            {bundle.bundle_id} if active_tiflash_mpp else set(),
+        )
         params = bundle_params(bundle, reference_time, bindings, preagg_bundles, preagg_layout)
         conn_wait_started = time.perf_counter()
         conn = pool.get()
@@ -599,6 +634,7 @@ def run_one_event_detailed(
                 "window_days": getattr(bundle, "window_days", None),
                 "base_filter": getattr(bundle, "base_filter", None),
                 "preagg_applied": bundle.bundle_id in preagg_bundles,
+                "tiflash_mpp_applied": active_tiflash_mpp,
                 "ms": (time.perf_counter() - started) * 1000.0,
                 "completed_ms": completed_ms,
                 "task_queue_ms": task_queue_ms,
@@ -613,6 +649,7 @@ def run_one_event_detailed(
                 "window_days": getattr(bundle, "window_days", None),
                 "base_filter": getattr(bundle, "base_filter", None),
                 "preagg_applied": bundle.bundle_id in preagg_bundles,
+                "tiflash_mpp_applied": active_tiflash_mpp,
                 "ms": -1.0,
                 "completed_ms": completed_ms,
                 "task_queue_ms": task_queue_ms,
@@ -731,6 +768,8 @@ def reader_thread(
     hinted_a,
     preagg_bundles,
     preagg_layout,
+    tiflash_mpp_bundles,
+    tiflash_mpp_all_events,
     normal_events,
     hot_events,
     hot_event_pct,
@@ -783,6 +822,8 @@ def reader_thread(
                             hinted_a,
                             preagg_bundles,
                             preagg_layout,
+                            tiflash_mpp_bundles,
+                            tiflash_mpp_all_events,
                             ev,
                             bundle_executor=bundle_executor,
                             store_bundle_results=store_bundle_results,
@@ -996,6 +1037,8 @@ def main() -> None:
     ap.add_argument("--preagg-bundle", action="append", default=[], help="Use daily pre-aggregation for this bundle id. Repeatable.")
     ap.add_argument("--preagg-layout", choices=["bundle", "prod180"], default=os.getenv("PREAGG_LAYOUT", "prod180"), help="Pre-agg physical layout to use for selected bundles.")
     ap.add_argument("--exclude-bundle", action="append", default=[], help="Do not execute this bundle id in the critical-path run. Repeatable fallback experiment.")
+    ap.add_argument("--tiflash-mpp-bundle", action="append", default=[], help="Apply query-level SET_VAR hints to force this runtime bundle through TiFlash MPP. Repeatable.")
+    ap.add_argument("--tiflash-mpp-all-events", action="store_true", help="Apply --tiflash-mpp-bundle to all events, not only matching hot-key events.")
     ap.add_argument("--skip-initial-warmup", action="store_true", help="Do not run the one normal + one hot preflight event before timing.")
     ap.add_argument("--reuse-events-json", default=None, help="Reuse sampled_normal_events and sampled_hot_events from a prior mixed_traffic JSON run.")
     args = ap.parse_args()
@@ -1053,6 +1096,12 @@ def main() -> None:
         all_bundles = [(bundle, group) for bundle, group in all_bundles if bundle.bundle_id not in excluded_bundles]
     if args.score_ready_bundles and not (1 <= args.score_ready_bundles <= len(all_bundles)):
         raise ValueError(f"--score-ready-bundles must be between 1 and {len(all_bundles)} executed bundles")
+    known_bundle_ids = {bundle.bundle_id for bundle, _ in all_bundles}
+    tiflash_mpp_bundles = set(args.tiflash_mpp_bundle)
+    if tiflash_mpp_bundles:
+        unknown = sorted(tiflash_mpp_bundles - known_bundle_ids)
+        if unknown:
+            raise ValueError(f"Unknown --tiflash-mpp-bundle ids: {', '.join(unknown)}")
     # Production-style baseline: let TiDB choose TiKV vs TiFlash by cost.
     # Older fixed-event demo runs forced TiFlash for a couple of Group A routing
     # bundles, but rotating-key traffic should not inherit one-off hints.
@@ -1075,6 +1124,12 @@ def main() -> None:
         )
     if preagg_bundles:
         print(f"Pre-agg bundles: {', '.join(sorted(preagg_bundles))}")
+    active_tiflash_mpp_bundles = sorted(tiflash_mpp_bundles - preagg_bundles)
+    skipped_tiflash_mpp_bundles = sorted(tiflash_mpp_bundles & preagg_bundles)
+    if active_tiflash_mpp_bundles:
+        print(f"TiFlash MPP runtime bundles: {', '.join(active_tiflash_mpp_bundles)}")
+    if skipped_tiflash_mpp_bundles:
+        print(f"Skipped TiFlash MPP hints for pre-agg bundles: {', '.join(skipped_tiflash_mpp_bundles)}")
 
     print(f"Building read pool ({args.pool_size})...")
     read_timeout_ms = args.read_max_execution_time_ms or None
@@ -1090,8 +1145,8 @@ def main() -> None:
         print("Skipping initial preflight event.")
     else:
         print("Running one normal and one hot preflight event...")
-        run_one_event_detailed(read_pool, all_bundles, hinted_a, preagg_bundles, args.preagg_layout, normal_events[0])
-        run_one_event_detailed(read_pool, all_bundles, hinted_a, preagg_bundles, args.preagg_layout, hot_events[0])
+        run_one_event_detailed(read_pool, all_bundles, hinted_a, preagg_bundles, args.preagg_layout, set(active_tiflash_mpp_bundles), args.tiflash_mpp_all_events, normal_events[0])
+        run_one_event_detailed(read_pool, all_bundles, hinted_a, preagg_bundles, args.preagg_layout, set(active_tiflash_mpp_bundles), args.tiflash_mpp_all_events, hot_events[0])
 
     stop_evt = threading.Event()
     read_results: list[dict[str, Any]] = []
@@ -1127,6 +1182,8 @@ def main() -> None:
             hinted_a,
             preagg_bundles,
             args.preagg_layout,
+            set(active_tiflash_mpp_bundles),
+            args.tiflash_mpp_all_events,
             normal_events,
             hot_events,
             args.hot_event_pct,
@@ -1288,6 +1345,9 @@ def main() -> None:
         "preagg_mode": args.preagg_mode,
         "preagg_layout": args.preagg_layout,
         "preagg_bundles": sorted(preagg_bundles),
+        "tiflash_mpp_bundles": active_tiflash_mpp_bundles,
+        "tiflash_mpp_hint": TIFLASH_MPP_HINT,
+        "tiflash_mpp_policy": "all-events" if args.tiflash_mpp_all_events else "hot-field-only",
         "excluded_bundles": sorted(excluded_bundles),
         "logical_bundle_count": logical_bundle_count,
         "executed_bundle_count": len(all_bundles),
