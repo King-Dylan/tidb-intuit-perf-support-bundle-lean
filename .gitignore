@@ -1,0 +1,21 @@
+.DS_Store
+
+# Local credentials/config. Keep these out of version control.
+**/.db_config.json
+*.pem
+*.key
+
+# Python/runtime artifacts.
+**/.venv/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Local run noise.
+**/logs/
+*.log
+
+# Large local database/client dumps, if any are produced during experiments.
+*.sql.gz
+*.dump
+*.bak
