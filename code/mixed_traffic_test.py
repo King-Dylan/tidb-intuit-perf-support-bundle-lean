@@ -553,6 +553,19 @@ def bundle_params(
             params.extend(key_values)
             params.extend(key_values)
             return tuple(params)
+        if not rollups and any(distinct.extra_predicate for distinct in distincts) and any(not distinct.extra_predicate for distinct in distincts):
+            # prod180 filtered distinct rewrite shares the raw-boundary scan and
+            # unfiltered helper scan, then keeps filtered distinct/presence paths
+            # as scalar subqueries.
+            params.extend(key_values)
+            params.extend(key_values)
+            for distinct in distincts:
+                if distinct.extra_predicate:
+                    params.extend(key_values)
+                    params.extend(key_values)
+                    params.extend(key_values)
+                    params.extend(key_values)
+            return tuple(params)
         if group == "C" and rollups and distincts and all(not tmpl.extra_predicate for tmpl in bundle.templates):
             # Mixed rollup+distinct Group C prod180 SQL uses three shared CTE
             # predicates: raw_boundary, rollup helper, and distinct helper.
@@ -721,6 +734,10 @@ def run_one_event_detailed(
         str(cutoff): sum(1 for b in successful if float(b["ms"]) <= cutoff)
         for cutoff in (50, 100, 150, 200, 250, 300, 350, 400, 450, 500)
     }
+    completion_cutoff_counts = {
+        str(cutoff): sum(1 for b in successful if float(b.get("completed_ms", 0.0)) <= cutoff)
+        for cutoff in (50, 100, 150, 200, 250, 300, 350, 400, 450, 500)
+    }
     return {
         "event": event["invoice_number"],
         "kind": event["kind"],
@@ -743,6 +760,7 @@ def run_one_event_detailed(
         "bundle_65th_completion_ms": bundle_65th_completion_ms,
         "slowest_bundles": slowest,
         "bundle_counts_by_cutoff": cutoff_counts,
+        "bundle_completion_counts_by_cutoff": completion_cutoff_counts,
         "bundle_results_omitted": not store_bundle_results,
         "bundle_results": bundle_results if store_bundle_results else [],
     }
@@ -856,14 +874,14 @@ def print_summary(label: str, rows: list[dict[str, Any]]) -> None:
     )
 
 
-def bundle_coverage_summary(rows: list[dict[str, Any]], bundle_count: int) -> dict[str, Any]:
+def bundle_coverage_summary(rows: list[dict[str, Any]], bundle_count: int, count_key: str = "bundle_counts_by_cutoff") -> dict[str, Any]:
     cutoffs = [50, 100, 150, 200, 350, 500]
     if not rows:
         return {"events": 0, "bundle_count": bundle_count}
 
     counts_by_cutoff: dict[int, list[int]] = {cutoff: [] for cutoff in cutoffs}
     for row in rows:
-        counts = row.get("bundle_counts_by_cutoff", {})
+        counts = row.get(count_key, {})
         for cutoff in cutoffs:
             counts_by_cutoff[cutoff].append(int(counts.get(str(cutoff), 0)))
 
@@ -904,7 +922,7 @@ def bundle_coverage_summary(rows: list[dict[str, Any]], bundle_count: int) -> di
         )
 
     over_500_or_error = [
-        bundle_count - int(row.get("bundle_counts_by_cutoff", {}).get("500", 0))
+        bundle_count - int(row.get(count_key, {}).get("500", 0))
         for row in rows
     ]
     histogram.append(
@@ -917,6 +935,7 @@ def bundle_coverage_summary(rows: list[dict[str, Any]], bundle_count: int) -> di
     return {
         "events": len(rows),
         "bundle_count": bundle_count,
+        "count_key": count_key,
         "by_cutoff": by_cutoff,
         "histogram": histogram,
     }
@@ -960,7 +979,8 @@ def print_bundle_coverage(summary: dict[str, Any]) -> None:
         return
     by_cutoff = summary["by_cutoff"]
     print()
-    print("Bundle coverage:")
+    label = "query runtime only" if summary.get("count_key") == "bundle_counts_by_cutoff" else "event completion time"
+    print(f"Bundle coverage ({label}):")
     for cutoff in (350, 500):
         row = by_cutoff[str(cutoff)]
         print(
@@ -1258,7 +1278,9 @@ def main() -> None:
     print_summary("Normal steady", normal_reads)
     print_summary("Hot-key steady", hot_reads)
     coverage = bundle_coverage_summary(steady_reads, len(all_bundles))
+    completion_coverage = bundle_coverage_summary(steady_reads, len(all_bundles), "bundle_completion_counts_by_cutoff")
     print_bundle_coverage(coverage)
+    print_bundle_coverage(completion_coverage)
     print_fanout_capacity(fanout_capacity)
     print_summary(
         "Bundle task queue avg per event",
@@ -1398,6 +1420,7 @@ def main() -> None:
             ),
         },
         "bundle_coverage": coverage,
+        "bundle_completion_coverage": completion_coverage,
         "read_pool_connection_replacements": getattr(read_pool, "replaced_connections", 0),
     }
     out = ROOT / "results" / f"mixed_traffic_{int(test_start)}.json"

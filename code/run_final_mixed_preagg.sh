@@ -14,6 +14,9 @@ PREAGG_LAYOUT="${PREAGG_LAYOUT:-prod180}"
 REUSE_EVENTS_JSON="${REUSE_EVENTS_JSON:-}"
 TIFLASH_MPP_BUNDLE_IDS="${TIFLASH_MPP_BUNDLE_IDS:-}"
 TIFLASH_MPP_ALL_EVENTS="${TIFLASH_MPP_ALL_EVENTS:-0}"
+EXCLUDE_BUNDLE_IDS="${EXCLUDE_BUNDLE_IDS:-}"
+SCORE_READY_BUNDLES="${SCORE_READY_BUNDLES:-0}"
+SCORE_READY_TIMEOUT_MS="${SCORE_READY_TIMEOUT_MS:-0}"
 NORMAL_EVENTS="${NORMAL_EVENTS:-900}"
 HOT_EVENTS_PER_FIELD="${HOT_EVENTS_PER_FIELD:-10}"
 POOL_SIZE="${POOL_SIZE:-300}"
@@ -68,6 +71,8 @@ ARGS=(
   --read-max-execution-time-ms "$READ_MAX_EXECUTION_TIME_MS"
   --preagg-mode "$PREAGG_MODE"
   --preagg-layout "$PREAGG_LAYOUT"
+  --score-ready-bundles "$SCORE_READY_BUNDLES"
+  --score-ready-timeout-ms "$SCORE_READY_TIMEOUT_MS"
   --skip-initial-warmup
 )
 
@@ -104,6 +109,13 @@ if [[ "$TIFLASH_MPP_ALL_EVENTS" == "1" ]]; then
   ARGS+=(--tiflash-mpp-all-events)
 fi
 
+if [[ -n "$EXCLUDE_BUNDLE_IDS" ]]; then
+  read -r -a EXCLUDED_BUNDLES <<< "$EXCLUDE_BUNDLE_IDS"
+  for bundle in "${EXCLUDED_BUNDLES[@]}"; do
+    ARGS+=(--exclude-bundle "$bundle")
+  done
+fi
+
 echo "Starting mixed traffic benchmark"
 echo "label=$LABEL duration=$DURATION read_rate=$READ_RATE hot_event_pct=$HOT_EVENT_PCT preagg_mode=$PREAGG_MODE preagg_layout=$PREAGG_LAYOUT read_max_execution_time_ms=$READ_MAX_EXECUTION_TIME_MS log=$LOG"
 python3 - "$READ_RATE" <<'PY'
@@ -114,6 +126,8 @@ PY
 echo "normal_events=$NORMAL_EVENTS hot_events_per_field=$HOT_EVENTS_PER_FIELD pool_size=$POOL_SIZE write_pool_size=$WRITE_POOL_SIZE event_workers=$EVENT_WORKERS bundle_workers=$BUNDLE_WORKERS max_pending_events=$MAX_PENDING_EVENTS unique_events_required=$UNIQUE_EVENTS_REQUIRED summary_only=$SUMMARY_ONLY no_writes=$NO_WRITES"
 echo "session: tidb_isolation_read_engines=$TIDB_ISOLATION_READ_ENGINES tidb_opt_force_inline_cte=$INTUIT_FORCE_INLINE_CTE"
 echo "tiflash_mpp_bundles=$TIFLASH_MPP_BUNDLE_IDS tiflash_mpp_all_events=$TIFLASH_MPP_ALL_EVENTS"
+echo "exclude_bundles=$EXCLUDE_BUNDLE_IDS"
+echo "score_ready_bundles=$SCORE_READY_BUNDLES score_ready_timeout_ms=$SCORE_READY_TIMEOUT_MS"
 
 python3 -u mixed_traffic_test.py "${ARGS[@]}" 2>&1 | tee "$LOG"
 

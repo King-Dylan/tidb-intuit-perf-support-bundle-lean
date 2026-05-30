@@ -564,7 +564,143 @@ WITH raw_boundary AS (
 )
 SELECT
   {final_select_sql}
-FROM distinct_values
+	FROM distinct_values
+	""".strip()
+
+
+def render_prod180_distinct_filtered_query(group: str, bundle, distincts: list[DistinctMetric], cutoff_parts: dict[str, Any]) -> str | None:
+    """Render distinct-only 180d query with shared unfiltered helper scan.
+
+    Some Group B bundles mix one filtered distinct/presence metric with several
+    unfiltered distinct metrics. The scalar fallback scans the large helper table
+    once per unfiltered metric. We can scan all unfiltered template_ids together
+    and keep the filtered metric on the scalar path where its extra predicate and
+    presence count are easier to preserve exactly.
+    """
+    filtered = [distinct for distinct in distincts if distinct.extra_predicate]
+    unfiltered = [distinct for distinct in distincts if not distinct.extra_predicate]
+    if not filtered or not unfiltered:
+        return None
+
+    keys = key_fields(bundle)
+    key_predicates = prod180_key_predicates("x", keys)
+    _, _, from_sql = source_parts(group)
+    raw_where_parts = (
+        raw_key_predicates(bundle)
+        + raw_not_null_predicates(group)
+        + [raw_window_predicate(group, cutoff_parts)]
+    )
+
+    raw_columns: list[str] = []
+    raw_unions: list[str] = []
+    unfiltered_selects: list[str] = []
+    template_ids = ", ".join(sql_literal(distinct.template_id) for distinct in unfiltered)
+    for index, distinct in enumerate(unfiltered):
+        raw_col = f"raw_distinct_{index}"
+        raw_columns.append(f"{distinct.distinct_expr} AS {quote_ident(raw_col)}")
+        raw_unions.append(
+            f"SELECT {sql_literal(distinct.template_id)} AS template_id, "
+            f"CAST({quote_ident(raw_col)} AS CHAR(256)) AS distinct_value "
+            f"FROM raw_boundary WHERE {quote_ident(raw_col)} IS NOT NULL"
+        )
+        unfiltered_selects.append(
+            f"COUNT(DISTINCT CASE WHEN template_id = {sql_literal(distinct.template_id)} "
+            f"THEN distinct_value END) AS {quote_ident(distinct.output_column)}"
+        )
+
+    ctes: list[str] = [
+        f"""raw_boundary AS (
+  SELECT
+    {",\n    ".join(raw_columns)}
+  {from_sql}
+  WHERE {" AND ".join(raw_where_parts)}
+)""",
+        f"""distinct_values AS (
+  SELECT x.template_id, x.distinct_value
+  FROM {quote_ident(prod180_distinct_table(group))} x
+  WHERE x.bundle_id = {sql_literal(bundle.bundle_id)}
+    AND x.template_id IN ({template_ids})
+    AND {" AND ".join(key_predicates)}
+    AND {prod180_full_day_predicate(group, "x", cutoff_parts["cutoff_day"])}
+  UNION ALL
+  {"\n  UNION ALL\n  ".join(raw_unions)}
+)""",
+        f"""unfiltered_counts AS (
+  SELECT
+    {",\n    ".join(unfiltered_selects)}
+  FROM distinct_values
+)""",
+    ]
+
+    filtered_names: dict[str, str] = {}
+    for index, distinct in enumerate(filtered):
+        cte_name = f"filtered_{index}"
+        filtered_names[distinct.template_id] = cte_name
+        predicates = prod180_key_predicates("x", keys)
+        raw_distinct_where_parts = (
+            raw_key_predicates(bundle)
+            + [f"{distinct.distinct_expr} IS NOT NULL"]
+            + raw_not_null_predicates(group)
+            + [raw_window_predicate(group, cutoff_parts)]
+        )
+        if distinct.extra_predicate:
+            raw_distinct_where_parts.append(f"({distinct.extra_predicate})")
+
+        presence_predicates = prod180_key_predicates("x", keys)
+        presence_col = presence_column(distinct.template_id)
+        raw_presence_where_parts = (
+            raw_key_predicates(bundle)
+            + raw_not_null_predicates(group)
+            + [raw_window_predicate(group, cutoff_parts)]
+        )
+        if distinct.extra_predicate:
+            raw_presence_where_parts.append(f"({distinct.extra_predicate})")
+
+        ctes.append(
+            f"""{cte_name} AS (
+  SELECT
+    (SELECT COUNT(DISTINCT u.distinct_value) FROM (
+      SELECT x.distinct_value
+      FROM {quote_ident(prod180_distinct_table(group))} x
+      WHERE x.bundle_id = {sql_literal(bundle.bundle_id)}
+        AND x.template_id = {sql_literal(distinct.template_id)}
+        AND {" AND ".join(predicates)}
+        AND {prod180_full_day_predicate(group, "x", cutoff_parts["cutoff_day"])}
+      UNION ALL
+      SELECT CAST({distinct.distinct_expr} AS CHAR(256)) AS distinct_value
+      {from_sql}
+      WHERE {" AND ".join(raw_distinct_where_parts)}
+    ) u) AS {quote_ident(distinct.output_column)},
+    COALESCE((SELECT SUM(u.presence_count) FROM (
+      SELECT x.{quote_ident(presence_col)} AS presence_count
+      FROM {quote_ident(prod180_rollup_table(group))} x
+      WHERE x.bundle_id = {sql_literal(bundle.bundle_id)}
+        AND {" AND ".join(presence_predicates)}
+        AND {prod180_full_day_predicate(group, "x", cutoff_parts["cutoff_day"])}
+      UNION ALL
+      SELECT COUNT(*) AS presence_count
+      {from_sql}
+      WHERE {" AND ".join(raw_presence_where_parts)}
+    ) u), 0) AS {quote_ident(presence_col)}
+)"""
+        )
+
+    final_selects: list[str] = []
+    for distinct in distincts:
+        if distinct.extra_predicate:
+            cte_name = filtered_names[distinct.template_id]
+            final_selects.append(f"{cte_name}.{quote_ident(distinct.output_column)}")
+            final_selects.append(f"{cte_name}.{quote_ident(presence_column(distinct.template_id))}")
+        else:
+            final_selects.append(f"unfiltered_counts.{quote_ident(distinct.output_column)}")
+
+    cross_joins = "\n".join(f"CROSS JOIN {name}" for name in filtered_names.values())
+    return f"""
+WITH {",\n".join(ctes)}
+SELECT
+  {",\n  ".join(final_selects)}
+FROM unfiltered_counts
+{cross_joins}
 """.strip()
 
 
@@ -702,6 +838,10 @@ def render_prod180_runtime_query(group: str, bundle, reference_time: datetime) -
     cutoff_parts = prod180_cutoff_parts(reference_time)
     if distincts and not rollups and not any(distinct.extra_predicate for distinct in distincts):
         return render_prod180_distinct_only_query(group, bundle, distincts, cutoff_parts) + ";"
+    if distincts and not rollups:
+        cte_sql = render_prod180_distinct_filtered_query(group, bundle, distincts, cutoff_parts)
+        if cte_sql:
+            return cte_sql + ";"
     if distincts and rollups and not any(distinct.extra_predicate for distinct in distincts):
         cte_sql = render_prod180_mixed_unfiltered_query(group, bundle, rollups, distincts, cutoff_parts)
         if cte_sql:
