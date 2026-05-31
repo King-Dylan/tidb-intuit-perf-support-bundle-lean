@@ -39,7 +39,10 @@ from lib.query_templates import load_query_templates
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "benchmark_results"
 DEFAULT_HINTED_GROUP_A_BUNDLES = {"group_a_bundle_002", "group_a_bundle_006"}
 DEFAULT_GROUP_A_DIMENSION_ROLLUP_BUNDLES = {
+    "group_a_bundle_002",
+    "group_a_bundle_006",
     "group_a_bundle_010",
+    "group_a_bundle_012",
     "group_a_bundle_014",
 }
 # Bundles verified in the support run. The renderer also auto-detects the same
@@ -74,6 +77,17 @@ def parse_bundle_set_env(env_name: str, default: set[str]) -> set[str]:
 GROUP_A_DIMENSION_ROLLUP_BUNDLES = parse_bundle_set_env(
     "INTUIT_GROUP_A_DIMENSION_ROLLUP_BUNDLES",
     DEFAULT_GROUP_A_DIMENSION_ROLLUP_BUNDLES,
+)
+
+DEFAULT_GROUP_C_INNER_JOIN_BUNDLES: set[str] = set()
+DEFAULT_GROUP_C_DEVICE_FIRST_JOIN_BUNDLES: set[str] = set()
+GROUP_C_INNER_JOIN_BUNDLES = parse_bundle_set_env(
+    "INTUIT_GROUP_C_INNER_JOIN_BUNDLES",
+    DEFAULT_GROUP_C_INNER_JOIN_BUNDLES,
+)
+GROUP_C_DEVICE_FIRST_JOIN_BUNDLES = parse_bundle_set_env(
+    "INTUIT_GROUP_C_DEVICE_FIRST_JOIN_BUNDLES",
+    DEFAULT_GROUP_C_DEVICE_FIRST_JOIN_BUNDLES,
 )
 
 
@@ -590,6 +604,8 @@ class GroupCBundleSpec:
     templates: tuple[GroupCTemplateSpec, ...]
 
     def render_sql(self, reference_time: datetime, hinted: bool = False) -> str:
+        if self.bundle_id in GROUP_C_DEVICE_FIRST_JOIN_BUNDLES:
+            return render_group_c_device_first_join_sql(self, reference_time, hinted=hinted)
         cutoff_ms = int(reference_time.timestamp() * 1000) - (self.window_days * 86400 * 1000)
         cutoff_dt = datetime.fromtimestamp(cutoff_ms / 1000).strftime("%Y-%m-%d %H:%M:%S.%f")
         select_parts: list[str] = []
@@ -598,11 +614,12 @@ class GroupCBundleSpec:
             if tmpl.extra_predicate:
                 select_parts.append(f"{build_presence_expr(tmpl.extra_predicate)} AS `{presence_column(tmpl.template_id)}`")
         select_prefix = "SELECT /*+ READ_FROM_STORAGE(TIFLASH[p,d]) */" if hinted else "SELECT"
+        join_keyword = "JOIN" if self.bundle_id in GROUP_C_INNER_JOIN_BUNDLES else "LEFT OUTER JOIN"
         sql = (
             select_prefix
             + "\n  "
             + ",\n  ".join(select_parts)
-            + "\nFROM pmt_txn_fact p\nLEFT OUTER JOIN deviceprofile_fact d"
+            + f"\nFROM pmt_txn_fact p\n{join_keyword} deviceprofile_fact d"
             + "\n  ON p.parsed_interaction_id = d.interaction_id"
             + f"\nWHERE {self.base_filter} AND p.event_date >= {cutoff_ms}"
             + f"\n  AND d.jms_timestamp >= '{cutoff_dt}'"
@@ -654,6 +671,29 @@ def build_group_c_metric_expr(tmpl: GroupCTemplateSpec) -> str:
 
 def build_presence_expr(condition: str) -> str:
     return f"SUM(CASE WHEN {condition} THEN 1 ELSE 0 END)"
+
+
+def render_group_c_device_first_join_sql(bundle: GroupCBundleSpec, reference_time: datetime, hinted: bool = False) -> str:
+    cutoff_ms = int(reference_time.timestamp() * 1000) - (bundle.window_days * 86400 * 1000)
+    cutoff_dt = datetime.fromtimestamp(cutoff_ms / 1000).strftime("%Y-%m-%d %H:%M:%S.%f")
+    select_parts: list[str] = []
+    for tmpl in bundle.templates:
+        select_parts.append(f"{build_group_c_metric_expr(tmpl)} AS `{metric_column(tmpl.template_id)}`")
+        if tmpl.extra_predicate:
+            select_parts.append(f"{build_presence_expr(tmpl.extra_predicate)} AS `{presence_column(tmpl.template_id)}`")
+    select_prefix = "SELECT /*+ READ_FROM_STORAGE(TIFLASH[p,d]) */" if hinted else "SELECT"
+    sql = (
+        select_prefix
+        + "\n  "
+        + ",\n  ".join(select_parts)
+        + "\nFROM deviceprofile_fact d\nJOIN pmt_txn_fact p"
+        + "\n  ON p.parsed_interaction_id = d.interaction_id"
+        + f"\nWHERE {bundle.base_filter} AND d.jms_timestamp >= '{cutoff_dt}'"
+        + f"\n  AND p.event_date >= {cutoff_ms}"
+    )
+    if has_redundant_group_by(bundle.bundle_id, bundle.base_filter, bundle.group_by_fields):
+        return sql + "\nHAVING COUNT(*) > 0;"
+    return sql + "\nGROUP BY " + ", ".join(bundle.group_by_fields) + ";"
 
 
 def cluster_group_c_templates() -> list[GroupCBundleSpec]:

@@ -527,6 +527,12 @@ def should_apply_tiflash_mpp(bundle, event: dict[str, Any], tiflash_mpp_bundles:
     return str(hot_field).lower() in bundle_filter_fields(bundle)
 
 
+def should_skip_null_binding(bundle, bindings: dict[str, Any]) -> bool:
+    if os.getenv("INTUIT_SKIP_NULL_BINDINGS", "1").strip().lower() in {"0", "false", "off", "no"}:
+        return False
+    return any(bindings.get(name) is None for name in getattr(bundle, "param_names", ()))
+
+
 def bundle_params(
     bundle,
     reference_time: datetime,
@@ -620,6 +626,21 @@ def run_one_event_detailed(
     def run_bundle(bundle, group: str, queued_at: float | None = None) -> dict[str, Any]:
         worker_started = time.perf_counter()
         task_queue_ms = ((worker_started - queued_at) * 1000.0) if queued_at is not None else 0.0
+        if should_skip_null_binding(bundle, bindings):
+            completed_ms = (time.perf_counter() - event_start) * 1000.0
+            return {
+                "bundle_id": bundle.bundle_id,
+                "group": group,
+                "window_days": getattr(bundle, "window_days", None),
+                "base_filter": getattr(bundle, "base_filter", None),
+                "preagg_applied": bundle.bundle_id in preagg_bundles,
+                "tiflash_mpp_applied": False,
+                "skipped_null_binding": True,
+                "ms": 0.0,
+                "completed_ms": completed_ms,
+                "task_queue_ms": task_queue_ms,
+                "conn_wait_ms": 0.0,
+            }
         active_tiflash_mpp = should_apply_tiflash_mpp(bundle, event, tiflash_mpp_bundles, all_events=tiflash_mpp_all_events)
         sql = render_bundle_sql(
             bundle,
