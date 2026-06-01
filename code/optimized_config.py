@@ -20,6 +20,15 @@ PROD180_PREAGG_BUNDLES = {
 }
 
 
+EXACT_SERVING_BUNDLES = {
+    "group_b_bundle_018",
+    "group_b_bundle_019",
+    "group_b_bundle_020",
+    "group_c_bundle_023",
+    "group_c_bundle_025",
+}
+
+
 OPTIMIZED_INDEXES = {
     "pmt_txn_fact": {
         "idx_pmt_merchant_runtime_cov": (

@@ -41,7 +41,8 @@ from demo import (
     cluster_group_c_templates,
 )
 from lib.db_config import get_db_config
-from optimized_config import PROD180_PREAGG_BUNDLES
+from exact_serving import render_serving_query, serving_params
+from optimized_config import EXACT_SERVING_BUNDLES, PROD180_PREAGG_BUNDLES
 from preagg_rollups import bundle_rollup_metrics, key_fields, render_prod180_runtime_query, render_runtime_query
 from sustained_test import writer_thread
 
@@ -495,9 +496,14 @@ def render_bundle_sql(
     hinted_a: set[str],
     preagg_bundles: set[str],
     preagg_layout: str,
+    serving_bundles: set[str] | None = None,
+    serving_as_of_grain: str = "day",
     tiflash_mpp_bundles: set[str] | None = None,
 ) -> str:
+    serving_bundles = serving_bundles or set()
     tiflash_mpp_bundles = tiflash_mpp_bundles or set()
+    if bundle.bundle_id in serving_bundles:
+        return render_serving_query(bundle, reference_time, serving_as_of_grain)
     if bundle.bundle_id in preagg_bundles:
         if preagg_layout == "prod180":
             return render_prod180_runtime_query(group, bundle, reference_time)
@@ -539,7 +545,12 @@ def bundle_params(
     bindings: dict[str, Any],
     preagg_bundles: set[str],
     preagg_layout: str = "bundle",
+    serving_bundles: set[str] | None = None,
+    serving_as_of_grain: str = "day",
 ) -> tuple[Any, ...]:
+    serving_bundles = serving_bundles or set()
+    if bundle.bundle_id in serving_bundles:
+        return serving_params(bundle, reference_time, bindings, serving_as_of_grain)
     if bundle.bundle_id not in preagg_bundles:
         return tuple(bindings.get(name) for name in bundle.param_names)
 
@@ -610,6 +621,8 @@ def run_one_event_detailed(
     hinted_a: set[str],
     preagg_bundles: set[str],
     preagg_layout: str,
+    serving_bundles: set[str],
+    serving_as_of_grain: str,
     tiflash_mpp_bundles: set[str],
     tiflash_mpp_all_events: bool,
     event: dict[str, Any],
@@ -634,6 +647,7 @@ def run_one_event_detailed(
                 "window_days": getattr(bundle, "window_days", None),
                 "base_filter": getattr(bundle, "base_filter", None),
                 "preagg_applied": bundle.bundle_id in preagg_bundles,
+                "serving_applied": bundle.bundle_id in serving_bundles,
                 "tiflash_mpp_applied": False,
                 "skipped_null_binding": True,
                 "ms": 0.0,
@@ -649,9 +663,19 @@ def run_one_event_detailed(
             hinted_a,
             preagg_bundles,
             preagg_layout,
+            serving_bundles,
+            serving_as_of_grain,
             {bundle.bundle_id} if active_tiflash_mpp else set(),
         )
-        params = bundle_params(bundle, reference_time, bindings, preagg_bundles, preagg_layout)
+        params = bundle_params(
+            bundle,
+            reference_time,
+            bindings,
+            preagg_bundles,
+            preagg_layout,
+            serving_bundles,
+            serving_as_of_grain,
+        )
         conn_wait_started = time.perf_counter()
         conn = pool.get()
         conn_wait_ms = (time.perf_counter() - conn_wait_started) * 1000.0
@@ -668,6 +692,7 @@ def run_one_event_detailed(
                 "window_days": getattr(bundle, "window_days", None),
                 "base_filter": getattr(bundle, "base_filter", None),
                 "preagg_applied": bundle.bundle_id in preagg_bundles,
+                "serving_applied": bundle.bundle_id in serving_bundles,
                 "tiflash_mpp_applied": active_tiflash_mpp,
                 "ms": (time.perf_counter() - started) * 1000.0,
                 "completed_ms": completed_ms,
@@ -683,6 +708,7 @@ def run_one_event_detailed(
                 "window_days": getattr(bundle, "window_days", None),
                 "base_filter": getattr(bundle, "base_filter", None),
                 "preagg_applied": bundle.bundle_id in preagg_bundles,
+                "serving_applied": bundle.bundle_id in serving_bundles,
                 "tiflash_mpp_applied": active_tiflash_mpp,
                 "ms": -1.0,
                 "completed_ms": completed_ms,
@@ -807,6 +833,8 @@ def reader_thread(
     hinted_a,
     preagg_bundles,
     preagg_layout,
+    serving_bundles,
+    serving_as_of_grain,
     tiflash_mpp_bundles,
     tiflash_mpp_all_events,
     normal_events,
@@ -861,6 +889,8 @@ def reader_thread(
                             hinted_a,
                             preagg_bundles,
                             preagg_layout,
+                            serving_bundles,
+                            serving_as_of_grain,
                             tiflash_mpp_bundles,
                             tiflash_mpp_all_events,
                             ev,
@@ -1074,9 +1104,11 @@ def main() -> None:
     ap.add_argument("--score-ready-bundles", type=int, default=0, help="Return an event once this many bundle queries have succeeded. 0 waits for all bundles.")
     ap.add_argument("--score-ready-timeout-ms", type=int, default=0, help="Stop waiting for score-ready bundles after this wall-clock timeout. 0 means no score-ready timeout.")
     ap.add_argument("--no-writes", action="store_true")
-    ap.add_argument("--preagg-mode", choices=["hybrid", "runtime-only"], default="hybrid", help="hybrid uses --preagg-bundle paths; runtime-only ignores pre-agg bundles.")
+    ap.add_argument("--preagg-mode", choices=["hybrid", "runtime-only", "serving"], default="hybrid", help="hybrid uses --preagg-bundle paths; serving overlays exact feature-serving lookups for selected bundles.")
     ap.add_argument("--preagg-bundle", action="append", default=[], help="Use daily pre-aggregation for this bundle id. Repeatable.")
     ap.add_argument("--preagg-layout", choices=["bundle", "prod180"], default=os.getenv("PREAGG_LAYOUT", "prod180"), help="Pre-agg physical layout to use for selected bundles.")
+    ap.add_argument("--serving-bundle", action="append", default=[], help="Use exact feature-serving lookup for this bundle id. Repeatable.")
+    ap.add_argument("--serving-as-of-grain", choices=["day", "timestamp"], default=os.getenv("INTUIT_SERVING_AS_OF_GRAIN", "day"), help="Serving lookup grain. day is reusable; timestamp preserves exact event reference times.")
     ap.add_argument("--exclude-bundle", action="append", default=[], help="Do not execute this bundle id in the critical-path run. Repeatable fallback experiment.")
     ap.add_argument("--tiflash-mpp-bundle", action="append", default=[], help="Apply query-level SET_VAR hints to force this runtime bundle through TiFlash MPP. Repeatable.")
     ap.add_argument("--tiflash-mpp-all-events", action="store_true", help="Apply --tiflash-mpp-bundle to all events, not only matching hot-key events.")
@@ -1143,14 +1175,22 @@ def main() -> None:
         unknown = sorted(tiflash_mpp_bundles - known_bundle_ids)
         if unknown:
             raise ValueError(f"Unknown --tiflash-mpp-bundle ids: {', '.join(unknown)}")
+    serving_bundles = set(args.serving_bundle)
+    if args.preagg_mode == "serving" and not serving_bundles:
+        serving_bundles = set(EXACT_SERVING_BUNDLES)
+    if serving_bundles:
+        unknown = sorted(serving_bundles - known_bundle_ids)
+        if unknown:
+            raise ValueError(f"Unknown --serving-bundle ids: {', '.join(unknown)}")
     # Production-style baseline: let TiDB choose TiKV vs TiFlash by cost.
     # Older fixed-event demo runs forced TiFlash for a couple of Group A routing
     # bundles, but rotating-key traffic should not inherit one-off hints.
     hinted_a: set[str] = set()
-    if args.preagg_mode == "hybrid":
+    if args.preagg_mode in {"hybrid", "serving"}:
         preagg_bundles = set(args.preagg_bundle)
         if not preagg_bundles and args.preagg_layout == "prod180":
             preagg_bundles = set(PROD180_PREAGG_BUNDLES)
+        preagg_bundles -= serving_bundles
     else:
         preagg_bundles = set()
     print(f"Bundles per event: {len(all_bundles)} executed ({logical_bundle_count} logical)")
@@ -1165,8 +1205,10 @@ def main() -> None:
         )
     if preagg_bundles:
         print(f"Pre-agg bundles: {', '.join(sorted(preagg_bundles))}")
-    active_tiflash_mpp_bundles = sorted(tiflash_mpp_bundles - preagg_bundles)
-    skipped_tiflash_mpp_bundles = sorted(tiflash_mpp_bundles & preagg_bundles)
+    if serving_bundles:
+        print(f"Exact serving bundles: {', '.join(sorted(serving_bundles))} as_of_grain={args.serving_as_of_grain}")
+    active_tiflash_mpp_bundles = sorted(tiflash_mpp_bundles - preagg_bundles - serving_bundles)
+    skipped_tiflash_mpp_bundles = sorted(tiflash_mpp_bundles & (preagg_bundles | serving_bundles))
     if active_tiflash_mpp_bundles:
         print(f"TiFlash MPP runtime bundles: {', '.join(active_tiflash_mpp_bundles)}")
     if skipped_tiflash_mpp_bundles:
@@ -1223,6 +1265,8 @@ def main() -> None:
             hinted_a,
             preagg_bundles,
             args.preagg_layout,
+            serving_bundles,
+            args.serving_as_of_grain,
             set(active_tiflash_mpp_bundles),
             args.tiflash_mpp_all_events,
             normal_events,
@@ -1388,6 +1432,8 @@ def main() -> None:
         "preagg_mode": args.preagg_mode,
         "preagg_layout": args.preagg_layout,
         "preagg_bundles": sorted(preagg_bundles),
+        "serving_bundles": sorted(serving_bundles),
+        "serving_as_of_grain": args.serving_as_of_grain,
         "tiflash_mpp_bundles": active_tiflash_mpp_bundles,
         "tiflash_mpp_hint": TIFLASH_MPP_HINT,
         "tiflash_mpp_policy": "all-events" if args.tiflash_mpp_all_events else "hot-field-only",

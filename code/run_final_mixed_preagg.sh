@@ -14,6 +14,8 @@ PREAGG_LAYOUT="${PREAGG_LAYOUT:-prod180}"
 REUSE_EVENTS_JSON="${REUSE_EVENTS_JSON:-}"
 TIFLASH_MPP_BUNDLE_IDS="${TIFLASH_MPP_BUNDLE_IDS:-}"
 TIFLASH_MPP_ALL_EVENTS="${TIFLASH_MPP_ALL_EVENTS:-0}"
+SERVING_BUNDLE_IDS="${SERVING_BUNDLE_IDS:-}"
+SERVING_AS_OF_GRAIN="${SERVING_AS_OF_GRAIN:-${INTUIT_SERVING_AS_OF_GRAIN:-day}}"
 EXCLUDE_BUNDLE_IDS="${EXCLUDE_BUNDLE_IDS:-}"
 SCORE_READY_BUNDLES="${SCORE_READY_BUNDLES:-0}"
 SCORE_READY_TIMEOUT_MS="${SCORE_READY_TIMEOUT_MS:-0}"
@@ -71,6 +73,7 @@ ARGS=(
   --read-max-execution-time-ms "$READ_MAX_EXECUTION_TIME_MS"
   --preagg-mode "$PREAGG_MODE"
   --preagg-layout "$PREAGG_LAYOUT"
+  --serving-as-of-grain "$SERVING_AS_OF_GRAIN"
   --score-ready-bundles "$SCORE_READY_BUNDLES"
   --score-ready-timeout-ms "$SCORE_READY_TIMEOUT_MS"
   --skip-initial-warmup
@@ -109,6 +112,13 @@ if [[ "$TIFLASH_MPP_ALL_EVENTS" == "1" ]]; then
   ARGS+=(--tiflash-mpp-all-events)
 fi
 
+if [[ -n "$SERVING_BUNDLE_IDS" ]]; then
+  read -r -a SERVING_BUNDLES <<< "$SERVING_BUNDLE_IDS"
+  for bundle in "${SERVING_BUNDLES[@]}"; do
+    ARGS+=(--serving-bundle "$bundle")
+  done
+fi
+
 if [[ -n "$EXCLUDE_BUNDLE_IDS" ]]; then
   read -r -a EXCLUDED_BUNDLES <<< "$EXCLUDE_BUNDLE_IDS"
   for bundle in "${EXCLUDED_BUNDLES[@]}"; do
@@ -126,6 +136,7 @@ PY
 echo "normal_events=$NORMAL_EVENTS hot_events_per_field=$HOT_EVENTS_PER_FIELD pool_size=$POOL_SIZE write_pool_size=$WRITE_POOL_SIZE event_workers=$EVENT_WORKERS bundle_workers=$BUNDLE_WORKERS max_pending_events=$MAX_PENDING_EVENTS unique_events_required=$UNIQUE_EVENTS_REQUIRED summary_only=$SUMMARY_ONLY no_writes=$NO_WRITES"
 echo "session: tidb_isolation_read_engines=$TIDB_ISOLATION_READ_ENGINES tidb_opt_force_inline_cte=$INTUIT_FORCE_INLINE_CTE"
 echo "tiflash_mpp_bundles=$TIFLASH_MPP_BUNDLE_IDS tiflash_mpp_all_events=$TIFLASH_MPP_ALL_EVENTS"
+echo "serving_bundles=$SERVING_BUNDLE_IDS serving_as_of_grain=$SERVING_AS_OF_GRAIN"
 echo "exclude_bundles=$EXCLUDE_BUNDLE_IDS"
 echo "score_ready_bundles=$SCORE_READY_BUNDLES score_ready_timeout_ms=$SCORE_READY_TIMEOUT_MS"
 
