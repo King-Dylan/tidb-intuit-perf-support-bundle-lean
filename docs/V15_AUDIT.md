@@ -7,7 +7,7 @@ v15 is ready to configure against the Premium/BYOC database and start the full m
 Remote EC2 compile/shell validation passed on:
 
 ```text
-/home/ec2-user/intuit-demo-v15
+/home/ec2-user/tidb-demo-v15
 ```
 
 Validated files:
@@ -49,7 +49,7 @@ run_prod_180d_preagg_parallel.sh
 
 ## Recommended Run Order
 
-1. Configure Premium/BYOC database credentials in `/home/ec2-user/intuit-demo-v15/.db_config.json`.
+1. Configure Premium/BYOC database credentials in `/home/ec2-user/tidb-demo-v15/.db_config.json`.
 2. Run `./run_v15_full_monthly_premium_build.sh`.
 3. Delete/restore the cluster if we want a cleaner cluster/cache state before benchmark.
 4. Run `./run_v15_prod180_benchmark.sh 3 300`.

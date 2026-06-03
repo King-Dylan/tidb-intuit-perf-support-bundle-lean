@@ -1,6 +1,8 @@
-# Intuit TiDB Performance Support Bundle
+# TiDB Performance Support Bundle
 
-Lean internal bundle for Hua/Jinlong/TSE review. This contains only the files needed to recreate the final demo build, validate the data/pre-agg tables, and run the benchmark using whole-number events/sec.
+Lean performance-support bundle for review. This contains only the files needed
+to recreate the final demo build, validate the data/pre-agg tables, and run the
+benchmark using whole-number events/sec.
 
 This bundle intentionally excludes older experiment helpers and the separate `run_qps_ladder.py` harness. The benchmark runner is the same event/sec harness used for the demo.
 
@@ -242,15 +244,15 @@ REMOTE=ec2-user@ec2-44-242-164-82.us-west-2.compute.amazonaws.com
 KEY=/path/to/rp-us-west-2.pem
 
 ssh -i "$KEY" -o StrictHostKeyChecking=no "$REMOTE" \
-  'mkdir -p ~/tidb_intuit_perf_support_bundle_lean/code/go-loadgen ~/tidb_intuit_perf_support_bundle_lean/code/results'
+  'mkdir -p ~/tidb-perf-support-bundle-lean/code/go-loadgen ~/tidb-perf-support-bundle-lean/code/results'
 
 scp -i "$KEY" -o StrictHostKeyChecking=no \
   code/go-loadgen/go-loadgen-linux-amd64 \
-  "$REMOTE":~/tidb_intuit_perf_support_bundle_lean/code/go-loadgen/
+  "$REMOTE":~/tidb-perf-support-bundle-lean/code/go-loadgen/
 
 scp -i "$KEY" -o StrictHostKeyChecking=no \
   code/results/go_workload_1000_hybrid_prod180_180d_serving_wide_paramwin.json \
-  "$REMOTE":~/tidb_intuit_perf_support_bundle_lean/code/results/
+  "$REMOTE":~/tidb-perf-support-bundle-lean/code/results/
 ```
 
 Make sure the EC2 client also has `code/.db_config.json`.
@@ -261,7 +263,7 @@ Use this only to verify that the binary, workload JSON, and database config are
 valid. It is not a peak-capacity test.
 
 ```bash
-cd ~/tidb_intuit_perf_support_bundle_lean/code
+cd ~/tidb-perf-support-bundle-lean/code
 ulimit -n 30000
 
 ./go-loadgen/go-loadgen-linux-amd64 \
@@ -282,9 +284,9 @@ ulimit -n 30000
 Use the fleet runner when testing 1000 events/sec. Each remote host must already
 have:
 
-- `~/tidb_intuit_perf_support_bundle_lean/code/go-loadgen/go-loadgen-linux-amd64`
-- `~/tidb_intuit_perf_support_bundle_lean/code/results/go_workload_1000_hybrid_prod180_180d_serving_wide_paramwin.json`
-- `~/tidb_intuit_perf_support_bundle_lean/code/.db_config.json`
+- `~/tidb-perf-support-bundle-lean/code/go-loadgen/go-loadgen-linux-amd64`
+- `~/tidb-perf-support-bundle-lean/code/results/go_workload_1000_hybrid_prod180_180d_serving_wide_paramwin.json`
+- `~/tidb-perf-support-bundle-lean/code/.db_config.json`
 
 Create a host file with one EC2 client per line. The June 2 run used 8 EC2
 client instances in us-west-2:
@@ -310,7 +312,7 @@ prefix="go_fleet16_8host_eventfanout_1000eps_3000c_600s_no_maxexec_$(date +%s)"
 python3 code/run_go_loadgen_fleet.py \
   --hosts "$(paste -sd, /tmp/codex_go_hosts8.txt)" \
   --ssh-key /path/to/rp-us-west-2.pem \
-  --remote-dir '~/tidb_intuit_perf_support_bundle_lean/code' \
+  --remote-dir '~/tidb-perf-support-bundle-lean/code' \
   --workload results/go_workload_1000_hybrid_prod180_180d_serving_wide_paramwin.json \
   --db-config .db_config.json \
   --events-total 1000000 \
@@ -361,45 +363,20 @@ The Go output prints and stores these key summaries:
   workers/connections.  If `query_runtime` rises under load, the bottleneck is no
   longer Python/client scheduling.
 
-### 7. June 2 Fleet Results
+### 7. Grafana Steady-State Snapshot
 
-These are reference results from the June 2, 2026 Go fleet runs; refresh them
-after any cluster size, RCU, serving-table, TiDB node count, or client-location
-change.
+The screenshot below is a database-side example from a steady fleet run. It is
+useful for checking whether TiDB sees the intended SQL command shape and whether
+database-side query duration is inside the target range.
 
-| Run | Result |
-| --- | --- |
-| 8 EC2 / 16 apps / 1000 connections / 1000 EPS / 120s | completed `830.88 EPS`, Primary `8.07 EPS`, Fallback `14.74 EPS`, errors `0` |
-| 8 EC2 / 16 apps / 2000 connections / 1000 EPS / 90s | completed `878.61 EPS`, Primary `183.15 EPS`, Fallback `287.16 EPS`, errors `0` |
-| 8 EC2 / 16 apps / 3000 connections / 1000 EPS / 90s | completed `914.55 EPS`, Primary `578.08 EPS`, Fallback `830.15 EPS`, errors `0` |
-| 8 EC2 / 16 apps / 3000 connections / 1000 EPS / 600s | completed `942.19 EPS`, Primary `42.07 EPS`, Fallback `51.90 EPS`, errors `2` (`invalid connection`) |
-
-The 3000-connection fleet run can drive the cluster into the intended steady
-shape: roughly 65K SQL commands/sec for a 1000 events/sec workload with 65 SQLs
-per event. The Grafana screenshot below shows the TiDB-side command/QPS plateau
-during the steady phase, and the database-side query duration p99 is within the
-target range.
-
-![Grafana dashboard during 3000-connection Go fleet run](docs/images/grafana_3000conn_steady.jpeg)
-
-At the highlighted steady-state cursor in the screenshot:
-
-- TiDB `query OK` reached `65.5K` commands/sec max and was still around `56.0K`
-  commands/sec at the cursor.
-- TiDB `Select` reached `65.5K` QPS max and was around `54.4K` QPS at the cursor.
-- TiDB-side duration was `p99=56.1ms`, `p95=25.4ms`, and `p80=12.5ms`.
-- Failed query OPM stayed at `0` in this view.
+![Grafana dashboard during Go fleet run](docs/images/grafana_3000conn_steady.jpeg)
 
 Metric scope matters:
 
-- Grafana is the database-side view. It shows the cluster can sustain the
-  intended SQL-command shape and that SQL duration p99 is meeting the target in
-  the observed steady window.
-- Go loadgen JSON is the app/event fan-in view. Its `full_65_of_65` and
-  `score_ready_60_of_65` numbers measure how fast each synthetic event sees all
-  65, or 60 of 65, SQL responses return through the client. Use these numbers
-  to analyze app-side scheduling/fan-in behavior; do not use them to contradict
-  the database-side p99 shown by Grafana.
+- Grafana is the database-side view. Use it to confirm SQL-command throughput,
+  TiDB-side query duration, and cluster resource headroom.
+- Go loadgen JSON is the app/event fan-in view. Use `full_65_of_65` and
+  `score_ready_60_of_65` to calculate event-level primary/fallback SLA.
 
 ## Client-Side Diagnostics
 

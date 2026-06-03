@@ -1,4 +1,4 @@
-# Intuit Demo v15 Runbook
+# TiDB Demo v15 Runbook
 
 v15 is the full-scale Premium/BYOC validation of the winning v12 design.
 
